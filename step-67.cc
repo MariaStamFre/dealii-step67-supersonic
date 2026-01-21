@@ -114,7 +114,7 @@ namespace Euler_DG
   {
       lax_friedrichs_modified,
       harten_lax_vanleer,
-      hllc,
+      // hllc,
   };
  
   constexpr EulerNumericalFlux numerical_flux_type = harten_lax_vanleer;
@@ -712,7 +712,7 @@ namespace Euler_DG
                    ((s_pos * (flux_m * normal) - s_neg * (flux_p * normal)) -
                     s_pos * s_neg * (u_m - u_p));
           }
-
+/*
         case hllc:
          {
           const auto avg_velocity_normal =
@@ -773,7 +773,7 @@ namespace Euler_DG
 
           return numerical_flux_hllc;
          }
-
+*/
         default:
           {
             Assert(false, ExcNotImplemented());
