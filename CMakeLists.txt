@@ -17,11 +17,13 @@ SET(TARGET "step-67")
 # page of the documentation.
 SET(TARGET_SRC
   ${TARGET}.cc
+  basicZeroFun.hpp
+  extendedAssert.hpp
   )
 
 # Usually, you will not need to modify anything beyond this point...
 
-CMAKE_MINIMUM_REQUIRED(VERSION 3.1.0)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.6.0)
 
 FIND_PACKAGE(deal.II 9.3.0
   HINTS ${deal.II_DIR} ${DEAL_II_DIR} ../ ../../ $ENV{DEAL_II_DIR}

@@ -12,13 +12,17 @@
  * the top level directory of deal.II.
  *
  * ---------------------------------------------------------------------
-
  *
- * Author: Martin Kronbichler, 2020
+ * Discontinuous Galerkin Methods for high Mach number flows,
+ * for the course Advanced Programming for Scientific Computing,
+ * Master in Mathematical Engineering, Politecnico di Milano
+ * 
+ * Copyright (C) 2026 Maria Stamatiou Freri, Yeji Wi
+ * 
+ * Based on deal.II tutorial step-67, Martin Kronbichler, 2020
  */
 
-// The include files are similar to the previous matrix-free tutorial programs
-// step-37, step-48, and step-59
+// Include files
 #include <deal.II/base/conditional_ostream.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/logstream.h>
@@ -34,14 +38,18 @@
 #include <deal.II/fe/fe_dgq.h>
 #include <deal.II/fe/fe_system.h>
 
+#include <deal.II/fe/mapping_q.h>
+
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/tria.h>
+#include <deal.II/grid/manifold_lib.h>
 
 #include <deal.II/lac/affine_constraints.h>
 #include <deal.II/lac/la_parallel_vector.h>
 
 #include <deal.II/matrix_free/fe_evaluation.h>
 #include <deal.II/matrix_free/matrix_free.h>
+#include <deal.II/matrix_free/operators.h>
 
 #include <deal.II/numerics/data_out.h>
 
@@ -49,40 +57,36 @@
 #include <iomanip>
 #include <iostream>
 
-// The following file includes the CellwiseInverseMassMatrix data structure
-// that we will use for the mass matrix inversion, the only new include
-// file for this tutorial program:
-#include <deal.II/matrix_free/operators.h>
-
-
+#include "basicZeroFun.hpp"
 
 namespace Euler_DG
 {
   using namespace dealii;
 
-  // Similarly to the other matrix-free tutorial programs, we collect all
-  // parameters that control the execution of the program at the top of the
-  // file. Besides the dimension and polynomial degree we want to run with, we
-  // also specify a number of points in the Gaussian quadrature formula we
-  // want to use for the nonlinear terms in the Euler equations. Furthermore,
-  // we specify the time interval for the time-dependent problem, and
-  // implement two different test cases. The first one is an analytical
-  // solution in 2D, whereas the second is a channel flow around a cylinder as
-  // described in the introduction. Depending on the test case, we also change
-  // the final time up to which we run the simulation, and a variable
-  // `output_tick` that specifies in which intervals we want to write output
-  // (assuming that the tick is larger than the time step size).
+  // We collect all parameters that control the execution of the program at the
+  // top of the file. Besides the dimension and polynomial degree we want to
+  // run with, we also specify a number of points in the Gaussian quadrature
+  // formula we want to use for the nonlinear terms in the Euler equations.
+  // We activate or deactivate the use of slope limiter between the time
+  // integrator stages. Furthermore, we specify the time interval for the
+  // time-dependent problem, and implement two different test cases. The first
+  // one is Sod's shock tube problem in 2D, whereas the second is a flow around
+  // a cylinder. Depending on the test case, we also change the final time up 
+  // to which we run the simulation, and a variable `output_tick` that specifies
+  // in which intervals we want to write output (assuming that the tick is larger 
+  // than the time step size).
   constexpr unsigned int testcase             = 0;
   constexpr unsigned int dimension            = 2;
-  constexpr unsigned int n_global_refinements = 3;
-  constexpr unsigned int fe_degree            = 5;
+  constexpr unsigned int n_global_refinements = 0;
+  constexpr unsigned int fe_degree            = 1;
   constexpr unsigned int n_q_points_1d        = fe_degree + 2;
+  constexpr unsigned int use_limiter          = 1;
 
   using Number = double;
 
   constexpr double gamma       = 1.4;
-  constexpr double final_time  = testcase == 0 ? 10 : 2.0;
-  constexpr double output_tick = testcase == 0 ? 1 : 0.05;
+  constexpr double final_time  = testcase == 0 ?   0.2 : 1;
+  constexpr double output_tick = testcase == 0 ? 0.005 : 0.025;
 
   // Next off are some details of the time integrator, namely a Courant number
   // that scales the time step size in terms of the formula $\Delta t =
@@ -91,7 +95,7 @@ namespace Euler_DG
   // methods. We specify the Courant number per stage of the Runge--Kutta
   // scheme, as this gives a more realistic expression of the numerical cost
   // for schemes of various numbers of stages.
-  const double courant_number = 0.15 / std::pow(fe_degree, 1.5);
+  const double courant_number = 0.05 / std::pow(fe_degree, 1.5);
   enum LowStorageRungeKuttaScheme
   {
     stage_3_order_3, /* Kennedy, Carpenter, Lewis, 2000 */
@@ -104,20 +108,31 @@ namespace Euler_DG
   // Eventually, we select a detail of the spatial discretization, namely the
   // numerical flux (Riemann solver) at the faces between cells. For this
   // program, we have implemented a modified variant of the Lax--Friedrichs
-  // flux and the Harten--Lax--van Leer (HLL) flux.
+  // flux, the Harten--Lax--van Leer (HLL) flux, and the Harten--Lax--van Leer
+  // Contact (HLLC).
   enum EulerNumericalFlux
   {
-    lax_friedrichs_modified,
-    harten_lax_vanleer,
+      lax_friedrichs_modified,
+      harten_lax_vanleer,
+      hllc,
   };
+ 
   constexpr EulerNumericalFlux numerical_flux_type = harten_lax_vanleer;
 
+  // Last we select limiting function and chose between minmod or van Albada.
+  // For the runs where Slope Limiter is active.
+  enum SlopeLimiterFunction
+  {
+    f_minmod,
+    f_van_albada,
+  };
 
+  constexpr SlopeLimiterFunction limiter = f_minmod;
 
   // @sect3{Equation data}
 
   // We now define a class with the exact solution for the test case 0 and one
-  // with a background flow field for test case 1 of the channel. Given that
+  // with a inflow field for test case 1 of the flow past cylinder. Given that
   // the Euler equations are a problem with $d+2$ equations in $d$ dimensions,
   // we need to tell the Function base class about the correct number of
   // components.
@@ -133,27 +148,16 @@ namespace Euler_DG
                          const unsigned int component = 0) const override;
   };
 
-
-
-  // As far as the actual function implemented is concerned, the analytical
-  // test case is an isentropic vortex case (see e.g. the book by Hesthaven
-  // and Warburton, Example 6.1 in Section 6.6 on page 209) which fulfills the
-  // Euler equations with zero force term on the right hand side. Given that
-  // definition, we return either the density, the momentum, or the energy
-  // depending on which component is requested. Note that the original
-  // definition of the density involves the $\frac{1}{\gamma -1}$-th power of
-  // some expression. Since `std::pow()` has pretty slow implementations on
-  // some systems, we replace it by logarithm followed by exponentiation (of
-  // base 2), which is mathematically equivalent but usually much better
-  // optimized. This formula might lose accuracy in the last digits
-  // for very small numbers compared to `std::pow()`, but we are happy with
-  // it anyway, since small numbers map to data close to 1.
+  // For Sod's analytical solution (see Sod's A survey of several finite 
+  // difference methods for systems of nonlinear hyperbolic conservation
+  // laws). We split the solution into regions following time and displacement.
+  // To solve the nonlinear shock strength we use apsc::secant() method.
   //
-  // For the channel test case, we simply select a density of 1, a velocity of
-  // 0.4 in $x$ direction and zero in the other directions, and an energy that
-  // corresponds to a speed of sound of 1.3 measured against the background
-  // velocity field, computed from the relation $E = \frac{c^2}{\gamma (\gamma
-  // -1)} + \frac 12 \rho \|u\|^2$.
+  // For the flow past cylinder test case, we select a density of 1.4, a pressure
+  // of 1.0, and a Mach number of 2. Velocity in $x$ direction is calculated based
+  // on Mach number and speed of sound. It is set to zero in other directions
+  // Energy is set to correspond the calculated speed of sound, ans is computed
+  // from the relation $E = \frac{c^2}{\gamma (\gamma-1)} + \frac 12 \rho \|u\|^2$.
   template <int dim>
   double ExactSolution<dim>::value(const Point<dim> & x,
                                    const unsigned int component) const
@@ -164,44 +168,139 @@ namespace Euler_DG
       {
         case 0:
           {
-            Assert(dim == 2, ExcNotImplemented());
-            const double beta = 5;
+            //left state (high pressure), state 1
+            const double rhoL = 1.0, uL = 0., pL = 1.;
+            //right state (low pressure), state 4
+            const double rhoR = 0.125, uR = 0., pR = 0.1;
+            
+            // midpoint of tube, where the diaphragm is at t=0.0
+            const double xm   = 0.0;
 
-            Point<dim> x0;
-            x0[0] = 5.;
-            const double radius_sqr =
-              (x - x0).norm_square() - 2. * (x[0] - x0[0]) * t + t * t;
-            const double factor =
-              beta / (numbers::PI * 2) * std::exp(1. - radius_sqr);
-            const double density_log = std::log2(
-              std::abs(1. - (gamma - 1.) / gamma * 0.25 * factor * factor));
-            const double density = std::exp2(density_log * (1. / (gamma - 1.)));
-            const double u       = 1. - factor * (x[1] - x0[1]);
-            const double v       = factor * (x[0] - t - x0[0]);
+            // Speed of sound
+            const double cL = sqrt(gamma*pL/rhoL);
+            const double cR = sqrt(gamma*pR/rhoR);
 
-            if (component == 0)
-              return density;
-            else if (component == 1)
-              return density * u;
-            else if (component == 2)
-              return density * v;
-            else
-              {
-                const double pressure =
-                  std::exp2(density_log * (gamma / (gamma - 1.)));
-                return pressure / (gamma - 1.) +
-                       0.5 * (density * u * u + density * v * v);
+            // nonlinear function for P (=P4/P1) shock strength
+            std::function<double(double)> Pcalc;
+            Pcalc = [pL,pR,cL,cR](double P){
+              double a = (gamma-1)*(cR/cL)*(P-1);
+              double b = sqrt(2*gamma*(2*gamma + (gamma+1)*(P-1) ));
+              return P - pL/pR*pow(( 1 - a/b ), 2.*gamma/(gamma-1.));
+            };
+            // solve P, with nonlinear scalar algorithm
+            auto [P, status] = apsc::secant(Pcalc, 0., 3.5, 1e-6);
+
+            const double c_contact = uL + 2*cL/(gamma-1)*(1- std::pow(P*pR/pL,((gamma-1.)/2/gamma)));
+            const double rho3 = rhoL * std::pow(P*pR/pL,1/gamma);
+            const double c_fanright = c_contact - sqrt(gamma*P*pR/rho3);
+            const double c_shock = uR + cR*sqrt( (gamma-1+P*(gamma+1))/(2*gamma) ); // shock velocity
+
+            // Positions to distinguish regions
+            const double x1 = xm - cL*t;
+            const double x2 = xm + c_fanright*t;
+            const double x3 = xm + c_contact*t;      // contact discontinuity
+            const double x4 = xm + c_shock*t; // shock position
+
+            if (x[0] < x1) {
+              // Region 1, left of rarefaction wave
+              if (component == 0){
+                return rhoL;
               }
+              else if (component == 1){
+                return uL;
+              }
+              else if (component == dim+1){
+                return 2.5*pL;
+              }
+              else{
+                return 0.;
+              }
+            }
+            else if (x[0] < x2)
+            {
+              // Region 2, rarefaction wave
+              const double u = 2/(gamma+1)*(cL+(x[0]-xm)/t);
+              const double rho = rhoL * std::pow( (1 - (gamma-1)/2. *u/cL), 2/(gamma-1));
+              if (component == 0) {
+                return rho;
+              }
+              else if (component == 1){
+                return u;
+              }
+              else if (component == dim+1){
+                const double p = pL * std::pow( (1 - (gamma-1)/2.*u/cL), 2*gamma/(gamma-1));
+                return 2.5*p;
+              }
+              else{
+                return 0.;
+              }
+            }
+            else if (x[0] <= x3)
+            {
+              // Region 3, between end of rarefaction wave and contact discontinuity
+              if (component == 0) {
+                return rho3;
+              }
+              else if (component == 1)
+              {
+                return c_contact;
+              }
+              else if (component == dim+1){
+                return 2.5*P*pR;
+              }
+              else{
+                return 0.;
+              }
+            }
+            else if (x[0] <= x4)
+            {
+              // Region 4, between contact discontinuity and shock
+              if (component == 0){
+                const double alpha = (gamma+1)/(gamma-1);
+                return (1 + alpha*P)/(alpha+P)*rhoR;
+              }
+              else if (component == 1){
+                return c_contact;
+              }
+              else if (component == dim+1){
+                return 2.5*P*pR;
+              }
+              else{
+                return 0.;
+              }
+            }
+            else {
+              // Region 5, rightmost after shock
+              if (component == 0){
+                return rhoR;
+              }
+              else if (component == 1){
+                return  uR;
+              }
+              else if (component == dim+1){
+                return 2.5*pR;
+              }
+              else {
+                return 0.;
+              }
+            }
           }
 
         case 1:
           {
+            constexpr double Mach = 2;
+            const double rho = 1.4;
+            const double p   = 1.0;
+            const double speed_of_sound = std::sqrt(gamma * p / rho);
+            const double u = Mach * speed_of_sound;
+            const double E = p / (gamma - 1.0) + 0.5 * rho * (u * u);
+
             if (component == 0)
-              return 1.;
+              return rho;
             else if (component == 1)
-              return 0.4;
+              return u;
             else if (component == dim + 1)
-              return 3.097857142857143;
+              return E;
             else
               return 0.;
           }
@@ -211,8 +310,6 @@ namespace Euler_DG
           return 0.;
       }
   }
-
-
 
   // @sect3{Low-storage explicit Runge--Kutta time integrators}
 
@@ -233,13 +330,6 @@ namespace Euler_DG
   // integrators. This is true also when taking into account that a
   // conventional Runge--Kutta scheme might allow for slightly larger time
   // steps as more free parameters allow for better stability properties.
-  //
-  // In this tutorial programs, we concentrate on a few variants of
-  // low-storage schemes defined in the article by Kennedy, Carpenter, and
-  // Lewis (2000), as well as one variant described by Tselios and Simos
-  // (2007). There is a large series of other schemes available, which could
-  // be addressed by additional sets of coefficients or slightly different
-  // update formulas.
   //
   // We define a single class for the four integrators, distinguished by the
   // enum described above. To each scheme, we then fill the vectors for the
@@ -273,16 +363,7 @@ namespace Euler_DG
             // The following scheme of seven stages and order four has been
             // explicitly derived for acoustics problems. It is a balance of
             // accuracy for imaginary eigenvalues among fourth order schemes,
-            // combined with a large stability region. Since DG schemes are
-            // dissipative among the highest frequencies, this does not
-            // necessarily translate to the highest possible time step per
-            // stage. In the context of the present tutorial program, the
-            // numerical flux plays a crucial role in the dissipation and thus
-            // also the maximal stable time step size. For the modified
-            // Lax--Friedrichs flux, this scheme is similar to the
-            // `stage_5_order_4` scheme in terms of step size per stage if only
-            // stability is considered, but somewhat less efficient for the HLL
-            // flux.
+            // combined with a large stability region.
           case stage_7_order_4:
             {
               lsrk = TimeStepping::LOW_STORAGE_RK_STAGE7_ORDER4;
@@ -312,6 +393,22 @@ namespace Euler_DG
     unsigned int n_stages() const
     {
       return bi.size();
+    }
+
+    // getter for coefficients, this will allow us to call pde_operator 
+    // perform_stage method without calling this class perform_time_step
+    std::vector<double> get_coeff(const std::string coeff) const
+    {
+      if (coeff == "ai"){
+        return ai;
+      }else if (coeff == "bi"){
+        return bi;
+      }else if (coeff == "ci"){
+        return ci;
+      }else{
+        AssertThrow(false,
+          ExcMessage("This coefficient name does not exist in the current integrator scheme"));
+      }
     }
 
     // The main function of the time integrator is to go through the stages,
@@ -509,17 +606,14 @@ namespace Euler_DG
   // continuous solution, the numerical flux can be seen as a control of the
   // jump of the solution from both sides to weakly impose continuity. It is
   // important to realize that a numerical flux alone cannot stabilize a
-  // high-order DG method in the presence of shocks, and thus any DG method
-  // must be combined with further shock-capturing techniques to handle those
-  // cases. In this tutorial, we focus on wave-like solutions of the Euler
-  // equations in the subsonic regime without strong discontinuities where our
-  // basic scheme is sufficient.
+  // high-order DG method in the presence of shocks, and thus why we pair it
+  // with slope limiting techniques.
   //
   // Nonetheless, the numerical flux is decisive in terms of the numerical
   // dissipation of the overall scheme and influences the admissible time step
-  // size with explicit Runge--Kutta methods. We consider two choices, a
+  // size with explicit Runge--Kutta methods. We consider three choices, a
   // modified Lax--Friedrichs scheme and the widely used Harten--Lax--van Leer
-  // (HLL) flux. For both variants, we first need to get the velocities and
+  // (HLL) flux. For all variants, we first need to get the velocities and
   // pressures from both sides of the interface and evaluate the physical
   // Euler flux.
   //
@@ -556,6 +650,11 @@ namespace Euler_DG
   // sound speed. For the velocity, we here choose a simple arithmetic average
   // which is sufficient for DG scenarios and moderate jumps in material
   // parameters.
+  //
+  // HLLC flux is an extension of the HLL where the missing contact and shear
+  // waves in the Euler equations are restored. It is a three-wave model where
+  // a middle wave of speed $s^{*}$ is included in addition to the $s^{p}$ and
+  // $s^{n}$.
   //
   // Since the numerical flux is multiplied by the normal vector in the weak
   // form, we multiply by the result by the normal vector for all terms in the
@@ -597,22 +696,83 @@ namespace Euler_DG
           }
 
         case harten_lax_vanleer:
-          {
+         {
             const auto avg_velocity_normal =
-              0.5 * ((velocity_m + velocity_p) * normal);
+                0.5 * ((velocity_m + velocity_p) * normal);
             const auto   avg_c = std::sqrt(std::abs(
-              0.5 * gamma *
-              (pressure_p * (1. / u_p[0]) + pressure_m * (1. / u_m[0]))));
+                0.5 * gamma *
+                (pressure_p * (1. / u_p[0]) + pressure_m * (1. / u_m[0]))));
             const Number s_pos =
-              std::max(Number(), avg_velocity_normal + avg_c);
+                std::max(Number(), avg_velocity_normal + avg_c);
             const Number s_neg =
-              std::min(Number(), avg_velocity_normal - avg_c);
+                std::min(Number(), avg_velocity_normal - avg_c);
             const Number inverse_s = Number(1.) / (s_pos - s_neg);
 
             return inverse_s *
                    ((s_pos * (flux_m * normal) - s_neg * (flux_p * normal)) -
                     s_pos * s_neg * (u_m - u_p));
           }
+
+        case hllc:
+         {
+          const auto avg_velocity_normal =
+            0.5 * ((velocity_m + velocity_p) * normal);
+          const auto   avg_c = std::sqrt(std::abs(
+              0.5 * gamma *
+              (pressure_p * (1. / u_p[0]) + pressure_m * (1. / u_m[0]))));
+          const Number s_pos =
+              std::max(Number(), avg_velocity_normal + avg_c);
+          const Number s_neg =
+              std::min(Number(), avg_velocity_normal - avg_c);
+
+          // compute star wave speed
+          const Number s_star =
+              (pressure_p - pressure_m + u_m[0] * (velocity_m * normal) * (s_neg - velocity_m * normal) -
+                  u_p[0] * (velocity_p * normal) * (s_pos - velocity_p * normal)) /
+              (u_m[0] * (s_neg - velocity_m * normal) - u_p[0] * (s_pos - velocity_p * normal));
+
+          // compute D* tensor
+          Tensor<1, dim + 2, Number> D_star;
+          D_star[0] = 0;
+          for (unsigned int d = 0; d < dim ; ++d) {
+              D_star[d + 1] = normal[d];
+          }
+          D_star[dim + 1] = s_star;
+
+          const double zero = 0.;
+          Tensor<1, dim + 2, Number> numerical_flux_hllc;
+
+          if (zero <= s_neg.data) {
+              numerical_flux_hllc = flux_m * normal;
+          }
+          else if (s_neg.data < zero && zero <= s_star.data) {
+
+              // numerical flux loop
+              const auto flux_normal = flux_m * normal;
+
+              for (unsigned int d = 0; d < dim + 2; ++d) {
+                  numerical_flux_hllc[d] = (s_star * (s_neg * u_m[d] - flux_normal[d]) +
+                      s_neg * (pressure_m + u_m[0] * (s_neg - velocity_m * normal) * (s_star - velocity_m * normal)) * D_star[d])
+                      / (s_neg - s_star);
+              }
+          }
+          else if (s_star.data < zero && zero < s_pos.data) {
+              // numerical flux loop
+              const auto flux_normal = flux_p * normal;
+
+              for (unsigned int d = 0; d < dim + 2; ++d) {
+                  numerical_flux_hllc[d] = (s_star * (s_pos * u_p[d] - flux_normal[d]) +
+                      s_pos * (pressure_p + u_m[0] * (s_pos - velocity_p * normal) * (s_star - velocity_p * normal)) * D_star[d])
+                      / (s_pos - s_star);
+              }
+          }
+          else {
+              //case_num = 3;
+              numerical_flux_hllc = flux_p * normal;
+          }
+
+          return numerical_flux_hllc;
+         }
 
         default:
           {
@@ -626,11 +786,9 @@ namespace Euler_DG
 
   // This and the next function are helper functions to provide compact
   // evaluation calls as multiple points get batched together via a
-  // VectorizedArray argument (see the step-37 tutorial for details). This
-  // function is used for the subsonic outflow boundary conditions where we
-  // need to set the energy component to a prescribed value. The next one
-  // requests the solution on all components and is used for inflow boundaries
-  // where all components of the solution are set.
+  // VectorizedArray argument. The next one requests the solution on all 
+  // components and is used for inflow boundaries where all components
+  // of the solution are set.
   template <int dim, typename Number>
   VectorizedArray<Number>
   evaluate_function(const Function<dim> &                      function,
@@ -667,31 +825,32 @@ namespace Euler_DG
     return result;
   }
 
+  // @sect3{The EulerOperator class}
 
-
-  // @sect3{The EulerOperation class}
-
-  // This class implements the evaluators for the Euler problem, in analogy to
-  // the `LaplaceOperator` class of step-37 or step-59. Since the present
-  // operator is non-linear and does not require a matrix interface (to be
-  // handed over to preconditioners), we skip the various `vmult` functions
-  // otherwise present in matrix-free operators and only implement an `apply`
-  // function as well as the combination of `apply` with the required vector
-  // updates for the low-storage Runge--Kutta time integrator mentioned above
-  // (called `perform_stage`). Furthermore, we have added three additional
-  // functions involving matrix-free routines, namely one to compute an
-  // estimate of the time step scaling (that is combined with the Courant
-  // number for the actual time step size) based on the velocity and speed of
-  // sound in the elements, one for the projection of solutions (specializing
-  // VectorTools::project() for the DG case), and one to compute the errors
-  // against a possible analytical solution or norms against some background
-  // state.
+  // This class implements the evaluators for the Euler problem. Since the 
+  // present operator is non-linear and does not require a matrix interface
+  // (to be handed over to preconditioners), we skip the various `vmult`
+  // functions otherwise present in matrix-free operators and only implement
+  // an `apply` function as well as the combination of `apply` with the
+  // required vector updates for the low-storage Runge--Kutta time integrator
+  // mentioned above (called `perform_stage`). Furthermore, we have added
+  // three additional functions involving matrix-free routines, namely one to
+  // compute an estimate of the time step scaling (that is combined with the
+  // Courant number for the actual time step size) based on the velocity and 
+  // speed of sound in the elements, one for the projection of solutions
+  // (specializing VectorTools::project() for the DG case), and one to compute
+  // the errors against a possible analytical solution or norms against some
+  // background state.
   //
-  // The rest of the class is similar to other matrix-free tutorials. As
-  // discussed in the introduction, we provide a few functions to allow a user
-  // to pass in various forms of boundary conditions on different parts of the
-  // domain boundary marked by types::boundary_id variables, as well as
-  // possible body forces.
+  // As discussed in the introduction, we provide a few functions to allow a
+  // user to pass in various forms of boundary conditions on different parts
+  // parts of the domain boundary marked by types::boundary_id variables, as
+  // as well as possible body forces.
+  //
+  // To pair the operator class with the slope limiter class, a forward 
+  // declaration of SlopeLimiter Class follows. 
+  template <int dim, int degree> class SlopeLimiter;
+
   template <int dim, int degree, int n_points_1d>
   class EulerOperator
   {
@@ -709,6 +868,9 @@ namespace Euler_DG
     void set_subsonic_outflow_boundary(
       const types::boundary_id       boundary_id,
       std::unique_ptr<Function<dim>> outflow_energy);
+    
+    void set_supersonic_outflow_boundary(
+      const types::boundary_id boundary_id);  
 
     void set_wall_boundary(const types::boundary_id boundary_id);
 
@@ -737,8 +899,11 @@ namespace Euler_DG
     double compute_cell_transport_speed(
       const LinearAlgebra::distributed::Vector<Number> &solution) const;
 
+    
     void
     initialize_vector(LinearAlgebra::distributed::Vector<Number> &vector) const;
+    
+    template <int _dim, int _degree> friend class SlopeLimiter;
 
   private:
     MatrixFree<dim, Number> data;
@@ -750,7 +915,11 @@ namespace Euler_DG
     std::map<types::boundary_id, std::unique_ptr<Function<dim>>>
                                    subsonic_outflow_boundaries;
     std::set<types::boundary_id>   wall_boundaries;
+    std::set<types::boundary_id> supersonic_outflow_boundaries;                              
     std::unique_ptr<Function<dim>> body_force;
+
+    const int _dim = dim;
+    const int _degree = degree;
 
     void local_apply_inverse_mass_matrix(
       const MatrixFree<dim, Number> &                   data,
@@ -775,6 +944,7 @@ namespace Euler_DG
       LinearAlgebra::distributed::Vector<Number> &      dst,
       const LinearAlgebra::distributed::Vector<Number> &src,
       const std::pair<unsigned int, unsigned int> &     face_range) const;
+
   };
 
 
@@ -788,22 +958,22 @@ namespace Euler_DG
 
   // For the initialization of the Euler operator, we set up the MatrixFree
   // variable contained in the class. This can be done given a mapping to
-  // describe possible curved boundaries as well as a DoFHandler object
-  // describing the degrees of freedom. Since we use a discontinuous Galerkin
-  // discretization in this tutorial program where no constraints are imposed
-  // strongly on the solution field, we do not need to pass in an
-  // AffineConstraints object and rather use a dummy for the
-  // construction. With respect to quadrature, we want to select two different
-  // ways of computing the underlying integrals: The first is a flexible one,
-  // based on a template parameter `n_points_1d` (that will be assigned the
-  // `n_q_points_1d` value specified at the top of this file). More accurate
-  // integration is necessary to avoid the aliasing problem due to the
-  // variable coefficients in the Euler operator. The second less accurate
-  // quadrature formula is a tight one based on `fe_degree+1` and needed for
-  // the inverse mass matrix. While that formula provides an exact inverse
-  // only on affine element shapes and not on deformed elements, it enables
-  // the fast inversion of the mass matrix by tensor product techniques,
-  // necessary to ensure optimal computational efficiency overall.
+  // describe possible curved boundaries as well as a DoFHandler object 
+  // describing the degrees of freedom. Since we use a discontinuous Galerkin 
+  // discretization where no constraints are imposed strongly on the solution 
+  // field, we do not need to pass in an AffineConstraints object and rather
+  // use a dummy for the construction. With respect to quadrature, we want to
+  // select two different ways of computing the underlying integrals: The 
+  // first is a flexible one, based on a template parameter `n_points_1d`
+  // (that will be assigned the `n_q_points_1d` value specified at the top of 
+  // this file). More accurate integration is necessary to avoid the aliasing
+  // problem due to the variable coefficients in the Euler operator. The
+  // second less accurate quadrature formula is a tight one based on
+  // `fe_degree+1` and needed for the inverse mass matrix. While that formula
+  // provides an exact inverse only on affine element shapes and not on 
+  // deformed elements, it enables the fast inversion of the mass matrix by 
+  // tensor product techniques, necessary to ensure optimal computational
+  // efficiency overall.
   template <int dim, int degree, int n_points_1d>
   void EulerOperator<dim, degree, n_points_1d>::reinit(
     const Mapping<dim> &   mapping,
@@ -827,6 +997,9 @@ namespace Euler_DG
        update_values);
     additional_data.tasks_parallel_scheme =
       MatrixFree<dim, Number>::AdditionalData::none;
+    additional_data.hold_all_faces_to_owned_cells       = true;
+    additional_data.mapping_update_flags_faces_by_cells = additional_data.mapping_update_flags_inner_faces | 
+      additional_data.mapping_update_flags_boundary_faces;
 
     data.reinit(
       mapping, dof_handlers, constraints, quadratures, additional_data);
@@ -841,9 +1014,7 @@ namespace Euler_DG
     data.initialize_dof_vector(vector);
   }
 
-
-
-  // The subsequent four member functions are the ones that must be called from
+  // The subsequent five member functions are the ones that must be called from
   // outside to specify the various types of boundaries. For an inflow boundary,
   // we must specify all components in terms of density $\rho$, momentum $\rho
   // \mathbf{u}$ and energy $E$. Given this information, we then store the
@@ -851,7 +1022,8 @@ namespace Euler_DG
   // this class. Likewise, we proceed for the subsonic outflow boundaries (where
   // we request a function as well, which we use to retrieve the energy) and for
   // wall (no-penetration) boundaries where we impose zero normal velocity (no
-  // function necessary, so we only request the boundary id). For the present
+  // function necessary, so we only request the boundary id). For supersonic
+  // outflow boundaries we do not prescribe any external data. For the present
   // DG code where boundary conditions are solely applied as part of the weak
   // form (during time integration), the call to set the boundary conditions
   // can appear both before or after the `reinit()` call to this class. This
@@ -860,7 +1032,7 @@ namespace Euler_DG
   // sent into MatrixFree for initialization, thus requiring to be set before
   // the initialization of the matrix-free data structures.
   //
-  // The checks added in each of the four function are used to
+  // The checks added in each of the five function are used to
   // ensure that boundary conditions are mutually exclusive on the various
   // parts of the boundary, i.e., that a user does not accidentally designate a
   // boundary as both an inflow and say a subsonic outflow boundary.
@@ -871,7 +1043,8 @@ namespace Euler_DG
   {
     AssertThrow(subsonic_outflow_boundaries.find(boundary_id) ==
                     subsonic_outflow_boundaries.end() &&
-                  wall_boundaries.find(boundary_id) == wall_boundaries.end(),
+                  wall_boundaries.find(boundary_id) == wall_boundaries.end() &&
+                  supersonic_outflow_boundaries.find(boundary_id) == supersonic_outflow_boundaries.end(),
                 ExcMessage("You already set the boundary with id " +
                            std::to_string(static_cast<int>(boundary_id)) +
                            " to another type of boundary before now setting " +
@@ -890,7 +1063,8 @@ namespace Euler_DG
   {
     AssertThrow(inflow_boundaries.find(boundary_id) ==
                     inflow_boundaries.end() &&
-                  wall_boundaries.find(boundary_id) == wall_boundaries.end(),
+                  wall_boundaries.find(boundary_id) == wall_boundaries.end() &&
+                  supersonic_outflow_boundaries.find(boundary_id) == supersonic_outflow_boundaries.end(),
                 ExcMessage("You already set the boundary with id " +
                            std::to_string(static_cast<int>(boundary_id)) +
                            " to another type of boundary before now setting " +
@@ -901,6 +1075,22 @@ namespace Euler_DG
     subsonic_outflow_boundaries[boundary_id] = std::move(outflow_function);
   }
 
+  template <int dim, int degree, int n_points_1d>
+  void EulerOperator<dim, degree, n_points_1d>::set_supersonic_outflow_boundary(
+    const types::boundary_id       boundary_id)
+  {
+    AssertThrow(inflow_boundaries.find(boundary_id) ==
+                    inflow_boundaries.end() &&
+                  wall_boundaries.find(boundary_id) == wall_boundaries.end() &&
+                  subsonic_outflow_boundaries.find(boundary_id) == subsonic_outflow_boundaries.end(),
+                ExcMessage("You already set the boundary with id " +
+                           std::to_string(static_cast<int>(boundary_id)) +
+                           " to another type of boundary before now setting " +
+                           "it as subsonic outflow"));
+
+    supersonic_outflow_boundaries.insert(boundary_id);
+  }
+
 
   template <int dim, int degree, int n_points_1d>
   void EulerOperator<dim, degree, n_points_1d>::set_wall_boundary(
@@ -909,7 +1099,8 @@ namespace Euler_DG
     AssertThrow(inflow_boundaries.find(boundary_id) ==
                     inflow_boundaries.end() &&
                   subsonic_outflow_boundaries.find(boundary_id) ==
-                    subsonic_outflow_boundaries.end(),
+                    subsonic_outflow_boundaries.end() &&
+                    supersonic_outflow_boundaries.find(boundary_id) == supersonic_outflow_boundaries.end(),
                 ExcMessage("You already set the boundary with id " +
                            std::to_string(static_cast<int>(boundary_id)) +
                            " to another type of boundary before now setting " +
@@ -932,83 +1123,54 @@ namespace Euler_DG
 
   // @sect4{Local evaluators}
 
-  // Now we proceed to the local evaluators for the Euler problem. The
-  // evaluators are relatively simple and follow what has been presented in
-  // step-37, step-48, or step-59. The first notable difference is the fact
-  // that we use an FEEvaluation with a non-standard number of quadrature
-  // points. Whereas we previously always set the number of quadrature points
-  // to equal the polynomial degree plus one (ensuring exact integration on
-  // affine element shapes), we now set the number quadrature points as a
-  // separate variable (e.g. the polynomial degree plus two or three halves of
-  // the polynomial degree) to more accurately handle nonlinear terms. Since
-  // the evaluator is fed with the appropriate loop lengths via the template
-  // argument and keeps the number of quadrature points in the whole cell in
-  // the variable FEEvaluation::n_q_points, we now automatically operate on
-  // the more accurate formula without further changes.
+  // Now we proceed to the local evaluators for the Euler problem. We use an 
+  // FEEvaluation with a non-standard number of quadrature points. We set
+  // the number quadrature points as a separate variable (e.g. the polynomial
+  // degree plus two or three halves of the polynomial degree) to more
+  // accurately handle nonlinear terms. Since the evaluator is fed with the
+  // appropriate loop lengths via the template argument and keeps the number
+  // of quadrature points in the whole cell in the variable 
+  // FEEvaluation::n_q_points, we now automatically operate on the more
+  // accurate formula without further changes.
   //
-  // The second difference is due to the fact that we are now evaluating a
-  // multi-component system, as opposed to the scalar systems considered
-  // previously. The matrix-free framework provides several ways to handle the
-  // multi-component case. The variant shown here utilizes an FEEvaluation
-  // object with multiple components embedded into it, specified by the fourth
-  // template argument `dim + 2` for the components in the Euler system. As a
-  // consequence, the return type of FEEvaluation::get_value() is not a scalar
-  // any more (that would return a VectorizedArray type, collecting data from
-  // several elements), but a Tensor of `dim+2` components. The functionality
-  // is otherwise similar to the scalar case; it is handled by a template
-  // specialization of a base class, called FEEvaluationAccess. An alternative
-  // variant would have been to use several FEEvaluation objects, a scalar one
-  // for the density, a vector-valued one with `dim` components for the
-  // momentum, and another scalar evaluator for the energy. To ensure that
-  // those components point to the correct part of the solution, the
-  // constructor of FEEvaluation takes three optional integer arguments after
-  // the required MatrixFree field, namely the number of the DoFHandler for
-  // multi-DoFHandler systems (taking the first by default), the number of the
-  // quadrature point in case there are multiple Quadrature objects (see more
-  // below), and as a third argument the component within a vector system. As
-  // we have a single vector for all components, we would go with the third
-  // argument, and set it to `0` for the density, `1` for the vector-valued
-  // momentum, and `dim+1` for the energy slot. FEEvaluation then picks the
-  // appropriate subrange of the solution vector during
-  // FEEvaluationBase::read_dof_values() and
+  // We are now evaluating a multi-component system. The matrix-free framework
+  // provides several ways to handle the multi-component case. The variant 
+  // shown here utilizes an FEEvaluation object with multiple components
+  // embedded into it, specified by the fourth template argument `dim + 2`
+  // for the components in the Euler system. As a consequence, the return type
+  // of FEEvaluation::get_value() is not a scalar any more (that would return
+  // a VectorizedArray type, collecting data from several elements), but a 
+  // Tensor of `dim+2` components. It is handled by a template specialization
+  // of a base class, called FEEvaluationAccess. To ensure that those
+  // components point to the correct part of the solution, the constructor of
+  // FEEvaluation takes three optional integer arguments after the required
+  // MatrixFree field, namely the number of the DoFHandler for multi-DoFHandler
+  // systems (taking the first by default), the number of the quadrature point
+  // in case there are multiple Quadrature objects, and as a third argument the 
+  // component within a vector system. As we have a single vector for all
+  // components, we would go with the third argument, and set it to `0` for the
+  // density, `1` for the vector-valued momentum, and `dim+1` for the energy slot.
+  // FEEvaluation then picks the appropriate subrange of the solution vector 
+  // during FEEvaluationBase::read_dof_values() and
   // FEEvaluation::distributed_local_to_global() or the more compact
   // FEEvaluation::gather_evaluate() and FEEvaluation::integrate_scatter()
   // calls.
   //
-  // When it comes to the evaluation of the body force vector, we distinguish
-  // between two cases for efficiency reasons: In case we have a constant
-  // function (derived from Functions::ConstantFunction), we can precompute
-  // the value outside the loop over quadrature points and simply use the
-  // value everywhere. For a more general function, we instead need to call
-  // the `evaluate_function()` method we provided above; this path is more
-  // expensive because we need to access the memory associated with the
-  // quadrature point data.
-  //
-  // The rest follows the other tutorial programs. Since we have implemented
-  // all physics for the Euler equations in the separate `euler_flux()`
-  // function, all we have to do here is to call this function
-  // given the current solution evaluated at quadrature points, returned by
-  // `phi.get_value(q)`, and tell the FEEvaluation object to queue the flux
-  // for testing it by the gradients of the shape functions (which is a Tensor
-  // of outer `dim+2` components, each holding a tensor of `dim` components
-  // for the $x,y,z$ component of the Euler flux). One final thing worth
-  // mentioning is the order in which we queue the data for testing by the
-  // value of the test function, `phi.submit_value()`, in case we are given an
-  // external function: We must do this after calling `phi.get_value(q)`,
-  // because `get_value()` (reading the solution) and `submit_value()`
-  // (queuing the value for multiplication by the test function and summation
-  // over quadrature points) access the same underlying data field. Here it
-  // would be easy to achieve also without temporary variable `w_q` since
-  // there is no mixing between values and gradients. For more complicated
-  // setups, one has to first copy out e.g. both the value and gradient at a
-  // quadrature point and then queue results again by
-  // FEEvaluationBase::submit_value() and FEEvaluationBase::submit_gradient().
-  //
-  // As a final note, we mention that we do not use the first MatrixFree
-  // argument of this function, which is a call-back from MatrixFree::loop().
-  // The interfaces imposes the present list of arguments, but since we are in
-  // a member function where the MatrixFree object is already available as the
-  // `data` variable, we stick with that to avoid confusion.
+  // Since we have implemented all physics for the Euler equations in the
+  // separate `euler_flux()` function, all we have to do here is to call
+  // this function given the current solution evaluated at quadrature
+  // points, returned by `phi.get_value(q)`, and tell the FEEvaluation
+  // object to queue the flux for testing it by the gradients of the shape
+  // functions (which is a Tensor of outer `dim+2` components, each holding a 
+  // tensor of `dim` components for the $x,y,z$ component of the Euler flux).
+  // One final thing worth mentioning is the order in which we queue the data
+  // for testing by thevalue of the test function, `phi.submit_value()`, in
+  // case we are given an external function: We must do this after calling
+  // `phi.get_value(q)`, because `get_value()` (reading the solution) and
+  // `submit_value()` (queuing the value for multiplication by the test
+  // function and summation over quadrature points) access the same underlying
+  // data field. Here it would be easy to achieve also without temporary
+  // variable `w_q` since there is no mixing between values and gradients.
   template <int dim, int degree, int n_points_1d>
   void EulerOperator<dim, degree, n_points_1d>::local_apply_cell(
     const MatrixFree<dim, Number> &,
@@ -1132,22 +1294,20 @@ namespace Euler_DG
 
         phi_p.integrate_scatter(EvaluationFlags::values, dst);
         phi_m.integrate_scatter(EvaluationFlags::values, dst);
+
       }
   }
 
 
-
   // For faces located at the boundary, we need to impose the appropriate
-  // boundary conditions. In this tutorial program, we implement four cases as
-  // mentioned above. (A fifth case, for supersonic outflow conditions is
-  // discussed in the "Results" section below.) The discontinuous Galerkin
-  // method imposes boundary conditions not as constraints, but only
-  // weakly. Thus, the various conditions are imposed by finding an appropriate
-  // <i>exterior</i> quantity $\mathbf{w}^+$ that is then handed to the
-  // numerical flux function also used for the interior faces. In essence,
-  // we "pretend" a state on the outside of the domain in such a way that
-  // if that were reality, the solution of the PDE would satisfy the boundary
-  // conditions we want.
+  // boundary conditions. We implement five cases as mentioned above. 
+  // The discontinuous Galerkin method imposes boundary conditions not as
+  // constraints, but only weakly. Thus, the various conditions are imposed by
+  // finding an appropriate <i>exterior</i>quantity $\mathbf{w}^+$ that is then
+  // handed to the numerical flux function also used for the interior faces. In
+  // essence, we "pretend" a state on the outside of the domain in such a way 
+  // that if that were reality, the solution of the PDE would satisfy the
+  // boundary conditions we want.
   //
   // For wall boundaries, we need to impose a no-normal-flux condition on the
   // momentum variable, whereas we use a Neumann condition for the density and
@@ -1164,28 +1324,12 @@ namespace Euler_DG
   // The imposition of outflow is essentially a Neumann condition, i.e.,
   // setting $\mathbf{w}^+ = \mathbf{w}^-$. For the case of subsonic outflow,
   // we still need to impose a value for the energy, which we derive from the
-  // respective function. A special step is needed for the case of
-  // <i>backflow</i>, i.e., the case where there is a momentum flux into the
-  // domain on the Neumann portion. According to the literature (a fact that can
-  // be derived by appropriate energy arguments), we must switch to another
-  // variant of the flux on inflow parts, see Gravemeier, Comerford,
-  // Yoshihara, Ismail, Wall, "A novel formulation for Neumann inflow
-  // conditions in biomechanics", Int. J. Numer. Meth. Biomed. Eng., vol. 28
-  // (2012). Here, the momentum term needs to be added once again, which
-  // corresponds to removing the flux contribution on the momentum
-  // variables. We do this in a post-processing step, and only for the case
-  // when we both are at an outflow boundary and the dot product between the
-  // normal vector and the momentum (or, equivalently, velocity) is
-  // negative. As we work on data of several quadrature points at once for
-  // SIMD vectorizations, we here need to explicitly loop over the array
+  // respective function. As we work on data of several quadrature points at once 
+  // for SIMD vectorizations, we here need to explicitly loop over the array
   // entries of the SIMD array.
   //
   // In the implementation below, we check for the various types
-  // of boundaries at the level of quadrature points. Of course, we could also
-  // have moved the decision out of the quadrature point loop and treat entire
-  // faces as of the same kind, which avoids some map/set lookups in the inner
-  // loop over quadrature points. However, the loss of efficiency is hardly
-  // noticeable, so we opt for the simpler code here. Also note that the final
+  // of boundaries at the level of quadrature points. Note that the final
   // `else` clause will catch the case when some part of the boundary was not
   // assigned any boundary condition via `EulerOperator::set_..._boundary(...)`.
   template <int dim, int degree, int n_points_1d>
@@ -1237,6 +1381,11 @@ namespace Euler_DG
                   dim + 1);
                 at_outflow = true;
               }
+            else if (supersonic_outflow_boundaries.find(boundary_id) != supersonic_outflow_boundaries.end())
+            {
+              w_p = w_m;
+              at_outflow = true;
+            }
             else
               AssertThrow(false,
                           ExcMessage("Unknown boundary id, did "
@@ -1313,7 +1462,6 @@ namespace Euler_DG
   }
 
 
-
   // @sect4{The apply() and related functions}
 
   // We now come to the function which implements the evaluation of the Euler
@@ -1382,7 +1530,6 @@ namespace Euler_DG
                      dst);
     }
   }
-
 
 
   // Let us move to the function that does an entire stage of a Runge--Kutta
@@ -1557,7 +1704,7 @@ namespace Euler_DG
       }
   }
 
-
+ 
 
   // The next function again repeats functionality also provided by the
   // deal.II library, namely VectorTools::integrate_difference(). We here show
@@ -1728,28 +1875,659 @@ namespace Euler_DG
     return max_transport;
   }
 
+  // @sect3{The SlopeLimiter class}
 
+  // This class encapsulates all necessary steps for slope limiting, following
+  // B.Cockburn's (2002) generalized slope limiter, as described in Discontinuous
+  // Galerkin methods paper for Non-linear hyperbolic conservation laws.
+  //
+  // It is relying on the use of MatrixFree data of the operator class. For that
+  // it is a friend class to EulerOperator class. 
+  //
+  // Core ingredient for applying slope limiting is the value of the average
+  // solution on a cell, and on the neighboring cells. Since the solution vector 
+  // is a LinearAlgebra::distributed::Vector<Number>, split between processes, it
+  // might be the case that a neighboring cell is on a different process. To solve
+  // this, we initialize a LinearAlgebra::distributed::Vector<Number> per conserved
+  // variable through initialize_cell_vectors(), which is only ran once. On every
+  // solution update, after computing locally the average per cell with method
+  // compute_cell_average(), we write on the parallel vector 'average_vectors' and
+  // we update the ghost entries, so the needed information reaches all processes.
+  //
+  // Additionally, we need to know which cells are the neighbors of the current/
+  // reference cell. This is identified through configure_neighbor_cells() which
+  // is ran once before the start of the time stepping loop. It only depends on the
+  // grid and does need any updates during simulation execution. It identifies the
+  // direction based on the distance from cell center to cell face, and saves the
+  // global index of the neighbor on that face, if it exists.
+  //
+  // Method compute_kxrcf() calculates indicator that turns limiting on or off. It
+  // follows the work on Shock detection and limiting with discontinuous galerkin 
+  // methods for hyperbolic conservation laws (2004) by L.Krivodonova, J.Xin, 
+  // J.Remacle, N.Chevaugeon, and J.Flaherty. It computes the indicator as \[
+  // I_j = \frac{\displaystyle\left|\int_{\partial \Omega^-} (Q_j - Q_{{nb}_j} )\,
+  // \mathrm{d}s\right|}{h^{\frac{p+1}{2}}\displaystyle\left|\partial \Omega_j^{-}
+  // \right|||Q_j||}\]
+  //
+  // Method compute_indicator() is an alternative calculation that computes the jump
+  // on a cell interface, presented in the work of B.Cockburn (2002). It was used on
+  // the early development of the class, and it is not used by the current program.
+  // For test case 1, Sod's shock tube problem, the results are identical to the 
+  // method compute_kxrcf().
+  //
+  // Method apply() does the actual limiting, based on the limiting function of
+  // choice, and sets the solution to \[ u_h\big|_{I_j}=\bar{v}_j+(x - x_j)\,
+  // m\!\left(v_{x,j},\;\frac{\bar{v}_{j+1} - \bar{v}_j}{\Delta_j / 2},\;
+  // \frac{\bar{v}_j - \bar{v}_{j-1}}{\Delta_j / 2}\right) \]
+  // It gets the mapping from unit to real cell, loops through the DOFs and 
+  // assigns the new calculated values to the right entries of the distributed
+  // solution vector.
+  //
+  // write_to_file() is a helper function that was used during development, to
+  // ensure that parallel distribution was working as expected. It was used 
+  // during the development of distribute_cell_average() and compute_kxrcf(). 
+  // It helped us a lot, and we thought of keeping it, despite not being called
+  // by the program.
+  template <int dim, int degree>
+  class SlopeLimiter
+  {
+    public:
+      SlopeLimiter();
+
+      void initialize_cell_vectors(
+        const parallel::distributed::Triangulation<dim> &triangulation,
+        const DoFHandler<dim> &dof_handler,
+        const MPI_Comm mpi_communicator);
+
+      void configure_neighbor_cells(
+        const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator
+      );  
+
+      void compute_cell_average(
+        const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+        const LinearAlgebra::distributed::Vector<Number> &solution);
+      
+      void distribute_cell_average();
+
+      void apply(
+        const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+        const FESystem<dim>& fe,
+        const Mapping<dim>& mapping,
+        LinearAlgebra::distributed::Vector<Number> &solution
+      );
+
+      void write_to_file(
+        const MPI_Comm mpi_communicator, const double timestep,
+        const DoFHandler<dim> &dof_handler,
+        std::map<types::global_cell_index, Number> &local_kxrcf);
+      
+      
+
+    private:
+      std::map<types::global_cell_index, Tensor<1, dim+2>> cell_averages; //local
+      std::map<types::global_cell_index, std::vector<int>> cell_neighbors; //local
+      std::vector<LinearAlgebra::distributed::Vector<Number>> average_vectors = {}; //global
+
+      std::map<types::global_cell_index, Number> local_kxrcf;
+      std::map<types::global_cell_index, Number> local_indicator;
+
+      const double Mdx2 = 0.0;
+
+      void compute_indicator(
+        const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+        LinearAlgebra::distributed::Vector<Number> &solution
+      );
+
+      void compute_kxrcf(
+        const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+        LinearAlgebra::distributed::Vector<Number> &solution
+      );
+
+      double minmod(const double& a,const double& b,
+        const double& c,const double& Mdx2);
+
+      double van_albada(const double& a,const double& b,
+        const double& c,const double& Mdx2, const double& eps);
+  };
+
+  template <int dim, int degree>
+  SlopeLimiter<dim, degree>::SlopeLimiter() {}
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::initialize_cell_vectors(
+    const parallel::distributed::Triangulation<dim> &triangulation,
+    const DoFHandler<dim> &dof_handler,
+    const MPI_Comm mpi_communicator)
+  {
+    average_vectors.resize(dim+2);
+
+    IndexSet locally_owned(triangulation.n_global_active_cells());
+    IndexSet ghost_indices(triangulation.n_global_active_cells());
+
+    typename DoFHandler<dim>::active_cell_iterator
+     cell = dof_handler.begin_active(),
+     endc = dof_handler.end();
+    
+    for (; cell!=endc; ++cell)
+    {
+      if (cell->is_locally_owned())
+        locally_owned.add_index(cell->global_active_cell_index());
+
+      if (cell->is_ghost())
+        ghost_indices.add_index(cell->global_active_cell_index());
+
+    }
+    locally_owned.compress();
+    ghost_indices.compress();
+
+    //initialize
+    for (unsigned int d = 0; d < dim + 2; ++d)
+    {
+      average_vectors[d].reinit(locally_owned, ghost_indices, mpi_communicator);
+    }
+  }
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::configure_neighbor_cells(
+    const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator
+  )
+  {
+    const double tol = 1e-12;
+    std::vector<int> tmp(2*dim,0);
+
+    for (unsigned int cell = 0; cell < euler_operator.data.n_cell_batches(); ++cell){
+      for (unsigned int v = 0; v < euler_operator.data.n_active_entries_per_cell_batch(cell); v++){
+
+        const auto cell_iter = euler_operator.data.get_cell_iterator(cell,v);
+        const auto global_index = cell_iter->global_active_cell_index();
+
+        // reset tmp
+        std::fill(tmp.begin(),tmp.end(),0);
+
+        for (unsigned int f = 0; f < GeometryInfo<dim>::faces_per_cell; ++f)
+        { 
+          if (cell_iter->at_boundary(f))
+            continue;
+          //from cell center to face center
+          Tensor<1, dim> direction = cell_iter->face(f)->center() - cell_iter->center();
+          const auto neighbor_iterator = cell_iter->neighbor(f);
+          const auto neighbor_index = neighbor_iterator->global_active_cell_index();
+
+          if (dim >= 1){
+            if (direction[0] < -tol){
+              tmp[0] = neighbor_index;  //left
+            }else if (direction[0] > tol){
+              tmp[1] = neighbor_index;  //right
+            }
+          }
+          if (dim >= 2){
+            if (direction[1] < -tol){
+              tmp[2] = neighbor_index;  //bottom
+            }else if (direction[1] > tol){
+              tmp[3] = neighbor_index;  //top
+            }
+          }
+          if (dim==3){
+            if (direction[2] < -tol){
+              tmp[4] = neighbor_index;  //back
+            }else if (direction[2] > tol){
+              tmp[5] = neighbor_index;  //front
+            }
+          }
+        }
+        cell_neighbors[global_index] = tmp;
+      }
+    }
+  }
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::compute_cell_average(
+    const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+    const LinearAlgebra::distributed::Vector<Number> &solution
+  )
+ {
+    FEEvaluation<dim, degree, n_q_points_1d, dim + 2, Number> phi(euler_operator.data, 0, 0);
+
+    for (unsigned int cell = 0; cell < euler_operator.data.n_cell_batches(); ++cell)
+    {
+      phi.reinit(cell);
+      phi.gather_evaluate(solution, EvaluationFlags::values);
+      Tensor<1, dim + 2, VectorizedArray<Number>> average;
+
+      for (unsigned int q = 0; q < phi.n_q_points; ++q)
+      {
+        const auto w_q = phi.get_value(q);
+        for (unsigned int d = 0; d < dim + 2; ++d)
+        {
+          average[d] += w_q[d] * phi.JxW(q);
+        }
+      }
+      for (unsigned int v = 0; v < euler_operator.data.n_active_entries_per_cell_batch(cell); v++)
+      {
+        const auto cell_iter = euler_operator.data.get_cell_iterator(cell,v);
+        average /= cell_iter->measure();
+
+        const auto global_index = cell_iter->global_active_cell_index();
+        for (unsigned int d = 0; d < dim + 2; ++d){
+          cell_averages[global_index][d] = average[d][v];
+        }
+      }
+    }
+  }
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::distribute_cell_average()
+  {
+    //update
+    for (unsigned int d = 0; d < dim + 2; ++d)
+    {
+      for (const auto &entry : cell_averages)
+        average_vectors[d][entry.first] = entry.second[d];
+      average_vectors[d].update_ghost_values();
+    }
+  }
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::compute_indicator(
+    const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+    LinearAlgebra::distributed::Vector<Number> &solution
+  )
+  {
+    const double tol = 1e-10;
+    FEFaceEvaluation<dim, degree, n_q_points_1d, dim + 2, Number> phi(euler_operator.data, true);
+
+    for (unsigned int cell = 0; cell < euler_operator.data.n_cell_batches(); ++cell)
+    {
+      // loop over all cells of batch
+      for (unsigned int v = 0; v < euler_operator.data.n_active_entries_per_cell_batch(cell); v++)
+      {
+        // flag for limiter
+        int limiter_on = 0;
+        const auto cell_iter = euler_operator.data.get_cell_iterator(cell,v);
+        const auto j = cell_iter->global_active_cell_index();
+
+        //exit condition if cell is at boundary
+        if (cell_iter->at_boundary(0) || cell_iter->at_boundary(1) || cell_iter->at_boundary(2) || cell_iter->at_boundary(3))
+          continue;
+
+        // neighboring cells indexes
+        const types::global_cell_index l_cell = cell_neighbors[j][0];
+        const types::global_cell_index r_cell = cell_neighbors[j][1];
+        const types::global_cell_index b_cell = cell_neighbors[j][2];
+        const types::global_cell_index t_cell = cell_neighbors[j][3];
+
+        for (unsigned int face = 0; face < GeometryInfo<dim>::faces_per_cell; ++face)
+        {
+          phi.reinit(cell,face);
+          phi.gather_evaluate(solution, EvaluationFlags::values);
+
+          for (unsigned int q = 0; q < phi.n_q_points; ++q){
+            const auto w_q = phi.get_value(q);
+
+            //do while loop? with flag
+            // should I limit only based on density
+            Tensor<1, dim + 2, Number> v_q ;
+            for (unsigned int d = 0; d < dim + 2; ++d){
+              const Number avg = average_vectors[d][j];
+              const Number dbx = avg - average_vectors[d][l_cell];
+              const Number dfx = average_vectors[d][r_cell] - avg;
+              const Number dby = avg - average_vectors[d][b_cell];
+              const Number dfy = average_vectors[d][t_cell] - avg;
+              // for face 0
+              if (face == 0){
+                const Number diff = avg - w_q[d][v];
+                v_q[d] = avg - minmod(diff,dbx,dfx,0.0);
+              }
+              // for face 1
+              if (face == 1){
+                const Number diff = w_q[d][v] - avg;
+                v_q[d] = avg + minmod(diff,dbx,dfx,0.0);
+              }
+              if (face == 2){
+                const Number diff = avg - w_q[d][v];
+                v_q[d] = avg - minmod(diff,dby,dfy,0.0);
+              }
+              if (face == 3){
+                const Number diff = w_q[d][v] - avg;
+                v_q[d] = avg + minmod(diff,dby,dfy,0.0);
+              }
+              if (std::abs(v_q[d] - w_q[d][v]) > tol){
+                limiter_on = 1;
+              }
+            }
+          }
+        }
+        local_indicator[j] = limiter_on;
+      // end of active cells in batch loop
+      }
+    }
+  }
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::compute_kxrcf(
+    const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+    LinearAlgebra::distributed::Vector<Number> &solution)
+  {
+    // minus = interior side of the face,
+    // plus  = neighbor side
+    FEFaceEvaluation<dim, degree, n_q_points_1d, dim + 2, Number> phi_m(euler_operator.data, /*is_interior_face=*/true);
+    FEFaceEvaluation<dim, degree, n_q_points_1d, dim + 2, Number> phi_p(euler_operator.data, /*is_interior_face=*/false);
+
+    // Loop over cell batches 
+    for (unsigned int cell_batch = 0; cell_batch < euler_operator.data.n_cell_batches(); ++cell_batch)
+    {
+            
+      // Initialize with zero for this batch
+      VectorizedArray<Number> jump_int(0.0); // ∫_{∂Ω_j^-} |Q_j - Q_nb| ds
+      VectorizedArray<Number> inflow_area(0.0); // |∂Ω_j^-| 
+
+      // Loop over faces of cells in this batch
+      for (unsigned int face = 0; face < GeometryInfo<dim>::faces_per_cell; ++face)
+      {
+        // Only handle inner faces 
+        if (euler_operator.data.get_faces_by_cells_boundary_id(cell_batch, face)[0] == numbers::internal_face_boundary_id)
+        {
+
+          // minus side = current cell
+          phi_m.reinit(cell_batch, face);
+          phi_m.gather_evaluate(solution, EvaluationFlags::values);
+
+          // plus side = neighbor
+          phi_p.reinit(cell_batch, face);
+          phi_p.gather_evaluate(solution, EvaluationFlags::values);
+
+          // Loop quadrature points on this face
+          for (unsigned int q = 0; q < phi_m.n_q_points; ++q)
+          {
+            const auto wq_m   = phi_m.get_value(q);        // state from current cell
+            const auto wq_p   = phi_p.get_value(q);        // state from neighbor
+            const auto normal = phi_m.get_normal_vector(q); // outward normal from current cell(minus side)
+            const auto JxWf   = phi_m.JxW(q);              // face JxW 
+
+            // Compute velocity on current cell.
+            // u_i = (rho u_i)/rho
+
+            VectorizedArray<Number> un_dot_n(0.0); // velocity dot normal
+
+            // loop over dimensions
+            for (unsigned int d = 0; d < dim; ++d) 
+            {
+              // calculate u_n = u · n for cell vv
+              for (unsigned int vv = 0; vv < VectorizedArray<Number>::size(); ++vv)
+              {
+                const Number rho      = wq_m[0][vv];
+                const Number mom_d    = wq_m[1 + d][vv]; // rho u_d
+                const Number vel_d    = mom_d / rho;
+                un_dot_n[vv] += vel_d * normal[d][vv]; // u_n​= u⋅n = u_x * ​n_x ​+ u_y * ​n_y​
+              }
+            }
+
+            // Q = density rho = wq_m[0].
+            // Q_j    = wq_m[0]
+            // Q_nb_j = wq_p[0]
+            // |Q_j - Q_nb_j| integrated over inflow only
+
+            // Calculate the jump and inflow area
+            for (unsigned int vv = 0; vv < VectorizedArray<Number>::size(); ++vv)
+            {
+              // inflow test: u · n < 0 <=> inflow
+              // For inflow, we integrate the jump and inflow area
+              if (un_dot_n[vv] < Number(0.0))
+              {
+                const Number Q_here   = wq_m[0][vv];
+                const Number Q_nb     = wq_p[0][vv];
+                const Number jump_mag = std::abs(Q_here - Q_nb);
+
+              // integrate two things per cell in this batch
+                jump_int[vv]        += jump_mag * JxWf[vv]; // = |Q_j(x_q) - Q_nb(x_q)| * ∣J(x_q)∣ * W_q
+                inflow_area[vv] += JxWf[vv]; // == phi_m.JxW(q)[vv] = ∣J(x_q)∣ * W_q
+              }
+            }
+          }
+        } 
+      } //end of face loop
+
+      //for each SIMD lane
+      for (unsigned int v = 0; v < euler_operator.data.n_active_entries_per_cell_batch(cell_batch); ++v)
+      {
+        const auto cell_iter = euler_operator.data.get_cell_iterator(cell_batch, v);
+
+        // global cell id
+        const types::global_cell_index global_index = cell_iter->global_active_cell_index();
+
+        // Characteristic size h: diameter().
+        const Number h = cell_iter->diameter();
+
+        // ||Q_j|| in denominator: cell average for rho:
+        const Number Qnorm = std::abs(average_vectors[0][global_index]); // density avg magnitude
+
+        // inflow boundary size: |∂Ω_j^-|
+        // Accumulated it into inflow_area[v]
+        const Number inflow_measure = inflow_area[v];
+
+        // denominator: h^{(p+1)/2} * |∂Ω_j^-| * ||Q_j||
+        // p = polynomial degree
+        const Number denominator =
+          std::pow(h, Number(0.5 * (degree + 1))) * inflow_measure * Qnorm;
+
+        // Write the indicator value for this cell.
+        if (denominator > 1.0e-12) // avoid division by zero
+          local_kxrcf[global_index] = std::abs(jump_int[v]) / denominator;
+        else
+          local_kxrcf[global_index] = 0.0;
+
+      }
+    }
+  }
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::apply(
+    const EulerOperator<dim, fe_degree, n_q_points_1d>& euler_operator,
+    const FESystem<dim>& fe,
+    const Mapping<dim>& mapping,
+    LinearAlgebra::distributed::Vector<Number> &solution
+  )
+  {
+    const double tol = 1e-10;
+    FEEvaluation<dim, degree, n_q_points_1d, dim + 2, Number> phi(euler_operator.data, 0, 0);
+
+    std::vector<Number> dfx (dim + 2,0);
+    std::vector<Number> dbx (dim + 2,0);
+    std::vector<Number> Dx (dim + 2,0);
+    std::vector<Number> Dx_new (dim + 2,0);
+
+    std::vector<Number> dfy (dim + 2,0);
+    std::vector<Number> dby (dim + 2,0);
+    std::vector<Number> Dy (dim + 2,0);
+    std::vector<Number> Dy_new (dim + 2,0);
+
+    const std::vector<Point<dim>> &unit_points = fe.get_unit_support_points();
+    std::vector<Point<dim>> mapped_points(unit_points.size());
+    std::vector<unsigned int> dof_indices (fe.dofs_per_cell);
+
+    compute_kxrcf(euler_operator, solution);
+
+    for (unsigned int cell = 0; cell < euler_operator.data.n_cell_batches(); ++cell)
+    {
+      phi.reinit(cell);
+      phi.gather_evaluate(solution, EvaluationFlags::gradients);
+
+      // loop over all cells of batch
+      for (unsigned int v = 0; v < euler_operator.data.n_active_entries_per_cell_batch(cell); v++)
+      {
+        const auto cell_iter = euler_operator.data.get_cell_iterator(cell,v);
+        const auto j = cell_iter->global_active_cell_index();
+
+        //exit condition if cell is at boundary
+        if (cell_iter->at_boundary(0) || cell_iter->at_boundary(1) || cell_iter->at_boundary(2) || cell_iter->at_boundary(3))
+          continue;
+
+        //exit condition based on indicator
+        if (local_kxrcf[j] == 0)
+          continue;
+
+        // neighboring cells indexes
+        const types::global_cell_index l_cell = cell_neighbors[j][0];
+        const types::global_cell_index r_cell = cell_neighbors[j][1];
+        const types::global_cell_index b_cell = cell_neighbors[j][2];
+        const types::global_cell_index t_cell = cell_neighbors[j][3];
+
+        const Number dx = cell_iter->diameter() / std::sqrt(1.0*dim);
+        Tensor<1, dim, VectorizedArray<Number>> avg_grad;
+        Number change_x = 0;
+        Number change_y = 0;
+
+        for (unsigned int d = 0; d < dim + 2; ++d){
+          avg_grad = 0;
+          // compute average gradient
+          for (unsigned int q = 0; q < phi.n_q_points; ++q){
+            const auto dw_q = phi.get_gradient(q); //Tensor<1,dim+2,Tensor<1,dim,VectorizedArray<Number>>>
+            const auto JxW = phi.JxW(q);
+            avg_grad +=  dw_q[d] * JxW;
+          }
+          avg_grad /= cell_iter->measure();
+          Dx[d] = dx * avg_grad[0][v];
+          Dy[d] = dx * avg_grad[1][v];
+          const Number avg = average_vectors[d][j];
+          dbx[d] = avg - average_vectors[d][l_cell];
+          dfx[d] = average_vectors[d][r_cell] - avg;
+          dby[d] = avg - average_vectors[d][b_cell];
+          dfy[d] = average_vectors[d][t_cell] - avg;
+
+          // Apply limiting function
+          switch(limiter){
+            case f_minmod:
+              {
+                Dx_new[d] = minmod(Dx[d], 2*dbx[d], 2*dfx[d], 0.0);
+                Dy_new[d] = minmod(Dy[d], 2*dby[d], 2*dfy[d], 0.0);
+                break;
+              }
+            case f_van_albada:
+              {
+                const double eps = 1e-8;
+                Dx_new[d] = van_albada(Dx[d], 2*dbx[d], 2*dfx[d], 0.0, eps);
+                Dy_new[d] = van_albada(Dy[d], 2*dby[d], 2*dfy[d], 0.0, eps);
+                break;
+              }
+          
+            default:
+              Assert(false, ExcNotImplemented());
+          }
+          change_x += std::fabs(Dx_new[d] - Dx[d]);
+          change_y += std::fabs(Dy_new[d] - Dy[d]);
+
+          Dx_new[d] = Dx_new[d]/dx;
+          Dy_new[d] = Dy_new[d]/dx;
+        }
+        change_x /= (dim+2);
+        change_y /= (dim+2);
+
+        if (change_x + change_y < tol)
+          continue;
+
+        // get physical points of dof
+        for (unsigned int i =0; i <unit_points.size(); ++i){
+          mapped_points[i] = mapping.transform_unit_to_real_cell(cell_iter,unit_points[i]);
+        }
+
+        cell_iter->get_dof_indices(dof_indices);
+        for (unsigned int k = 0; k < fe.dofs_per_cell; ++k){
+          unsigned int d_i = fe.system_to_component_index(k).first;
+          Tensor<1,dim> dr = mapped_points[k] - cell_iter->center();
+          solution(dof_indices[k]) = average_vectors[d_i][j] + dr[0]*Dx_new[d_i] + dr[1]*Dy_new[d_i];
+        } 
+      // zero out vectors
+        std::fill(dfx.begin(),dfx.end(),0.0);
+        std::fill(dbx.begin(),dbx.end(),0.0);
+        std::fill(Dx.begin(),Dx.end(),0.0);
+        std::fill(Dx_new.begin(),Dx_new.end(),0.0);
+
+        std::fill(dfy.begin(),dfy.end(),0.0);
+        std::fill(dby.begin(),dby.end(),0.0);
+        std::fill(Dy.begin(),Dy.end(),0.0);
+        std::fill(Dy_new.begin(),Dy_new.end(),0.0);
+      // end of cell loop
+      }
+    }
+  }
+
+  template <int dim, int degree>
+  void SlopeLimiter<dim, degree>::write_to_file(
+    const MPI_Comm mpi_communicator, const double timestep,
+    const DoFHandler<dim> &dof_handler,
+    std::map<types::global_cell_index, Number> &local_kxrcf
+  )
+  {
+    const unsigned int rank = Utilities::MPI::this_mpi_process(mpi_communicator);
+    // Filename includes rank and timestep
+    std::ostringstream filename;
+    filename << "rank" << rank << ".txt";
+    std::ofstream ofs(filename.str());
+    ofs << std::setprecision(12);
+
+    typename DoFHandler<dim>::active_cell_iterator
+      cell = dof_handler.begin_active(),
+      endc = dof_handler.end();
+
+    ofs << "Timestep " << timestep << "\n";
+
+    for(; cell != endc; ++cell)
+    {
+      unsigned int idx = cell->global_active_cell_index();
+      if (cell->is_locally_owned())
+      //if(cell->is_ghost())
+      {
+        ofs << idx << " " << local_kxrcf[idx];
+        ofs << "\n";
+      }
+    }
+    ofs.close();
+
+  }
+
+  template <int dim, int degree>
+  double SlopeLimiter<dim, degree>::minmod(const double& a,const double& b,
+    const double& c,const double& Mdx2)
+  {
+    double aa = std::fabs(a);
+    if(aa < Mdx2) return a;
+
+    if(a*b > 0 && b*c > 0){
+      double s = (a > 0) ? 1.0 : -1.0;
+      return s * std::min(aa, std::min(std::fabs(b), std::fabs(c)));
+    }else
+      return 0;
+  }
+
+  template <int dim, int degree>
+  double SlopeLimiter<dim, degree>::van_albada(const double& a,const double& b,
+    const double& c,const double& Mdx2,const double& eps)
+  {
+    double aa = std::fabs(a);
+    if(aa < Mdx2) return a;
+
+    double inv = 1./((b*b)+(c*c)+2*(eps*eps));
+    return (((b*b + eps*eps)*c) + ((c*c + eps*eps)*b))*inv;
+  }
 
   // @sect3{The EulerProblem class}
 
-  // This class combines the EulerOperator class with the time integrator and
-  // the usual global data structures such as FiniteElement and DoFHandler, to
-  // actually run the simulations of the Euler problem.
+  // This class combines the EulerOperator class with the time integrator, the
+  // SlopeLimiter class, and standard global data structures such as 
+  // FiniteElement and DoFHandler, to actually run the simulations of the Euler
+  // problem.
   //
-  // The member variables are a triangulation, a finite element, a mapping (to
-  // create high-order curved surfaces, see e.g. step-10), and a DoFHandler to
-  // describe the degrees of freedom. In addition, we keep an instance of the
-  // EulerOperator described above around, which will do all heavy lifting in
-  // terms of integrals, and some parameters for time integration like the
-  // current time or the time step size.
+  // The member variables are a triangulation, a finite element, a mapping and
+  // a DoFHandler to  describe the degrees of freedom. In addition, we keep an
+  // instance of the EulerOperator described above around, which will do all
+  // heavy lifting in terms of integrals, and some parameters for time
+  // integration like the current time or the time step size.
   //
   // Furthermore, we use a PostProcessor instance to write some additional
-  // information to the output file, in similarity to what was done in
-  // step-33. The interface of the DataPostprocessor class is intuitive,
-  // requiring us to provide information about what needs to be evaluated
-  // (typically only the values of the solution, except for the Schlieren plot
-  // that we only enable in 2D where it makes sense), and the names of what
-  // gets evaluated. Note that it would also be possible to extract most
+  // information to the output file. The interface of the DataPostprocessor
+  // class is intuitive, requiring us to provide information about what needs
+  // to be evaluated (typically only the values of the solution) and the names
+  // of what gets evaluated. Note that it would also be possible to extract most
   // information by calculator tools within visualization programs such as
   // ParaView, but it is so much more convenient to do it already when writing
   // the output.
@@ -1777,12 +2555,13 @@ namespace Euler_DG
 #endif
 
     FESystem<dim>        fe;
-    MappingQGeneric<dim> mapping;
+    MappingQ<dim>       mapping;
     DoFHandler<dim>      dof_handler;
 
     TimerOutput timer;
 
     EulerOperator<dim, fe_degree, n_q_points_1d> euler_operator;
+    SlopeLimiter<dim, fe_degree> slope_limiter;
 
     double time, time_step;
 
@@ -1825,8 +2604,7 @@ namespace Euler_DG
   // variables of density $\rho$, momentum $\rho \mathbf{u}$ and energy $E$,
   // then we compute the derived velocity $\mathbf u$, the pressure $p$, the
   // speed of sound $c=\sqrt{\gamma p / \rho}$, as well as the Schlieren plot
-  // showing $s = |\nabla \rho|^2$ in case it is enabled. (See step-69 for
-  // another example where we create a Schlieren plot.)
+  // showing $s = |\nabla \rho|^2$ in case it is enabled.
   template <int dim>
   void EulerProblem<dim>::Postprocessor::evaluate_vector_field(
     const DataPostprocessorInputs::Vector<dim> &inputs,
@@ -1939,30 +2717,28 @@ namespace Euler_DG
     , dof_handler(triangulation)
     , timer(pcout, TimerOutput::never, TimerOutput::wall_times)
     , euler_operator(timer)
+    , slope_limiter()
     , time(0)
     , time_step(0)
   {}
 
 
 
-  // As a mesh, this tutorial program implements two options, depending on the
-  // global variable `testcase`: For the analytical variant (`testcase==0`),
-  // the domain is $(0, 10) \times (-5, 5)$, with Dirichlet boundary
-  // conditions (inflow) all around the domain. For `testcase==1`, we set the
-  // domain to a cylinder in a rectangular box, derived from the flow past
-  // cylinder testcase for incompressible viscous flow by Sch&auml;fer and
-  // Turek (1996). Here, we have a larger variety of boundaries. The inflow
-  // part at the left of the channel is given the inflow type, for which we
-  // choose a constant inflow profile, whereas we set a subsonic outflow at
-  // the right. For the boundary around the cylinder (boundary id equal to 2)
-  // as well as the channel walls (boundary id equal to 3) we use the wall
-  // boundary type, which is no-normal flow. Furthermore, for the 3D cylinder
-  // we also add a gravity force in vertical direction. Having the base mesh
-  // in place (including the manifolds set by
-  // GridGenerator::channel_with_cylinder()), we can then perform the
-  // specified number of global refinements, create the unknown numbering from
-  // the DoFHandler, and hand the DoFHandler and Mapping objects to the
-  // initialization of the EulerOperator.
+  // As a mesh, this program implements two options, depending on the
+  // global variable `testcase`: For the Sod's shock tube (`testcase==0`),
+  // the domain is $(-0.5, 0.5) \times (0, 0.2)$, with Dirichlet boundary
+  // conditions (inflow) on the left boundary, wall boundary conditions on
+  // top and bottom, and supersonic outflow on the right boundary. For 
+  // `testcase==1`, we set the domain as a concentric hyper shells geometry, 
+  // with the inner shell taking the role of the cylinder. The inflow part
+  // is the left outer shell and is given the inflow type, for which we
+  // choose a constant inflow profile, whereas we set a supersonic outflow at
+  // the right. For the boundary around the cylinder we use the wall boundary
+  // type, which is no-normal flow. Having the base mesh in place (including 
+  // the manifolds set by we can then perform the specified number of global
+  // refinements, create the unknown numbering from  the DoFHandler, and hand 
+  // the DoFHandler and Mapping objects to the initialization of the
+  // EulerOperator.
   template <int dim>
   void EulerProblem<dim>::make_grid_and_dofs()
   {
@@ -1970,43 +2746,111 @@ namespace Euler_DG
       {
         case 0:
           {
-            Point<dim> lower_left;
-            for (unsigned int d = 1; d < dim; ++d)
-              lower_left[d] = -5;
+            Assert(dim == 2, ExcNotImplemented());
 
-            Point<dim> upper_right;
-            upper_right[0] = 10;
-            for (unsigned int d = 1; d < dim; ++d)
-              upper_right[d] = 5;
-
-            GridGenerator::hyper_rectangle(triangulation,
-                                           lower_left,
-                                           upper_right);
-            triangulation.refine_global(2);
+            GridGenerator::subdivided_hyper_rectangle(triangulation,{160,13},Point<dim>(-0.5,0),Point<dim>(0.5,0.2));
+            for(auto &face : triangulation.active_face_iterators())
+            {
+              if(face->at_boundary())
+              {
+                //left boundary, id = 0, inflow
+                if(face->center()[0] == -0.5 ){
+                  face->set_boundary_id(0);
+                }
+                //right boundary, id = 1, outflow
+                if(face->center()[0] == 0.5){
+                  face->set_boundary_id(1);
+                }
+                //bottom boundary, id = 2, wall
+                if(face->center()[1] == 0){
+                  face->set_boundary_id(2);
+                }
+                //top boundary, id = 2, wall
+                if(face->center()[1] == 0.2){
+                  face->set_boundary_id(2);
+                }
+              }
+            }
 
             euler_operator.set_inflow_boundary(
-              0, std::make_unique<ExactSolution<dim>>(0));
+                  0, std::make_unique<ExactSolution<dim>>(0));
+            euler_operator.set_supersonic_outflow_boundary(1);
+            euler_operator.set_wall_boundary(2);
 
             break;
           }
 
         case 1:
           {
-            GridGenerator::channel_with_cylinder(
-              triangulation, 0.03, 1, 0, true);
+            Assert(dim == 2, ExcNotImplemented());
+            Assert(use_limiter == 1, ExcInvalidState());
+            Assert(n_global_refinements >= 2, ExcInvalidState());
+
+            triangulation.clear();
+
+            const Point<dim> center(0.2, 0.2);
+            const double inner_radius = 0.05;
+            const double outer_radius = 0.15;
+
+            Triangulation<dim> tmp;
+
+            const unsigned int n_shells = 16;          // radial layers on the coarse grid
+            const unsigned int n_cells_per_shell = 16; // cells around (circumferential)
+
+            GridGenerator::concentric_hyper_shells(tmp,
+                                                  center,
+                                                  inner_radius,
+                                                  outer_radius,
+                                                  n_shells,
+                                                  0.5,                 // skewness
+                                                  n_cells_per_shell,
+                                                  false);
+
+            //Cut the mesh at x = center[0];
+            std::set<typename Triangulation<dim>::active_cell_iterator> cells_to_remove;
+            for (const auto &cell : tmp.active_cell_iterators()){
+              const auto c = cell->center();
+              const double theta = std::atan2(c[1] - center[1], c[0] - center[0]);
+              
+              // remove right half: theta in (-pi/2, pi/2)
+              if (theta > -numbers::PI/2 && theta < numbers::PI/2){
+                cells_to_remove.insert(cell);
+              }
+            }
+            GridGenerator::create_triangulation_with_removed_cells(tmp, cells_to_remove, triangulation);
+            
+            const double tol_r = 1e-3;
+            for (auto &face : triangulation.active_face_iterators()){
+              if (face->at_boundary())
+              {
+
+                if (center.distance(face->center()) <= inner_radius)
+                {
+                  face->set_boundary_id(2); // wall
+                }
+                else if (std::abs(center.distance(face->vertex(0)) - outer_radius) < tol_r &&
+                        std::abs(center.distance(face->vertex(1)) - outer_radius) < tol_r)
+                {
+                  face->set_boundary_id(0); // inflow
+                }
+                else{
+                  face->set_boundary_id(1); // outflow
+                }
+              }
+            }
+
+            triangulation.set_all_manifold_ids(0);
+            const SphericalManifold<dim> spherical(center);
+            triangulation.set_manifold(0, spherical);
+
+            std::vector<unsigned int> ids = triangulation.get_manifold_ids();
+            Assert(count(ids.begin(),ids.end(),0) == 1,
+              ExcMessage("Inner manifold not attached"));
 
             euler_operator.set_inflow_boundary(
               0, std::make_unique<ExactSolution<dim>>(0));
-            euler_operator.set_subsonic_outflow_boundary(
-              1, std::make_unique<ExactSolution<dim>>(0));
-
+            euler_operator.set_supersonic_outflow_boundary(1);
             euler_operator.set_wall_boundary(2);
-            euler_operator.set_wall_boundary(3);
-
-            if (dim == 3)
-              euler_operator.set_body_force(
-                std::make_unique<Functions::ConstantFunction<dim>>(
-                  std::vector<double>({0., 0., -0.2})));
 
             break;
           }
@@ -2016,7 +2860,6 @@ namespace Euler_DG
       }
 
     triangulation.refine_global(n_global_refinements);
-
     dof_handler.distribute_dofs(fe);
 
     euler_operator.reinit(mapping, dof_handler);
@@ -2025,9 +2868,7 @@ namespace Euler_DG
     // In the following, we output some statistics about the problem. Because we
     // often end up with quite large numbers of cells or degrees of freedom, we
     // would like to print them with a comma to separate each set of three
-    // digits. This can be done via "locales", although the way this works is
-    // not particularly intuitive. step-32 explains this in slightly more
-    // detail.
+    // digits. This can be done via "locales".
     std::locale s = pcout.get_stream().getloc();
     pcout.get_stream().imbue(std::locale(""));
     pcout << "Number of degrees of freedom: " << dof_handler.n_dofs()
@@ -2038,31 +2879,27 @@ namespace Euler_DG
     pcout.get_stream().imbue(s);
   }
 
-
-
   // For output, we first let the Euler operator compute the errors of the
   // numerical results. More precisely, we compute the error against the
   // analytical result for the analytical solution case, whereas we compute
   // the deviation against the background field with constant density and
   // energy and constant velocity in $x$ direction for the second test case.
   //
-  // The next step is to create output. This is similar to what is done in
-  // step-33: We let the postprocessor defined above control most of the
-  // output, except for the primal field that we write directly. For the
-  // analytical solution test case, we also perform another projection of the
-  // analytical solution and print the difference between that field and the
-  // numerical solution. Once we have defined all quantities to be written, we
-  // build the patches for output. Similarly to step-65, we create a
-  // high-order VTK output by setting the appropriate flag, which enables us
-  // to visualize fields of high polynomial degrees. Finally, we call the
+  // The next step is to create output. We let the postprocessor defined above 
+  // control most of theoutput, except for the primal field that we write
+  // directly. For the analytical solution test case, we also perform another
+  // projection of the analytical solution and print the difference between that
+  // field and the numerical solution. Once we have defined all quantities to be
+  // written, webuild the patches for output. We create a high-order VTK output
+  // by setting  the appropriate flag, which enables us to visualize fields of
+  // polynomial degrees. Finally, we call the
   // `DataOutInterface::write_vtu_in_parallel()` function to write the result
   // to the given file name. This function uses special MPI parallel write
   // facilities, which are typically more optimized for parallel file systems
-  // than the standard library's `std::ofstream` variants used in most other
-  // tutorial programs. A particularly nice feature of the
-  // `write_vtu_in_parallel()` function is the fact that it can combine output
-  // from all MPI ranks into a single file, making it unnecessary to have a
-  // central record of all such files (namely, the "pvtu" file).
+  // than the standard library's `std::ofstream` variants. A particularly nice 
+  // feature of the `write_vtu_in_parallel()` function is the fact that it can
+  // combine output from all MPI ranks into a single file, making it unnecessary
+  // to have a central record of all such files (namely, the "pvtu" file).
   //
   // For parallel programs, it is often instructive to look at the partitioning
   // of cells among processors. To this end, one can pass a vector of numbers
@@ -2086,6 +2923,7 @@ namespace Euler_DG
   {
     const std::array<double, 3> errors =
       euler_operator.compute_errors(ExactSolution<dim>(time), solution);
+
     const std::string quantity_name = testcase == 0 ? "error" : "norm";
 
     pcout << "Time:" << std::setw(8) << std::setprecision(3) << time
@@ -2128,7 +2966,7 @@ namespace Euler_DG
       data_out.add_data_vector(solution, postprocessor);
 
       LinearAlgebra::distributed::Vector<Number> reference;
-      if (testcase == 0 && dim == 2)
+      if (testcase == 0)
         {
           reference.reinit(solution);
           euler_operator.project(ExactSolution<dim>(time), reference);
@@ -2164,12 +3002,10 @@ namespace Euler_DG
                              DataOut<dim>::curved_inner_cells);
 
       const std::string filename =
-        "solution_" + Utilities::int_to_string(result_number, 3) + ".vtu";
+        "results/solution_" + Utilities::int_to_string(result_number, 3) + ".vtu";
       data_out.write_vtu_in_parallel(filename, MPI_COMM_WORLD);
     }
   }
-
-
 
   // The EulerProblem::run() function puts all pieces together. It starts off
   // by calling the function that creates the mesh and sets up data structures,
@@ -2181,9 +3017,7 @@ namespace Euler_DG
   // time loop, we compute the time step size by the
   // `EulerOperator::compute_cell_transport_speed()` function. For reasons of
   // comparison, we compare the result obtained there with the minimal mesh
-  // size and print them to screen. For velocities and speeds of sound close
-  // to unity as in this tutorial program, the predicted effective mesh size
-  // will be close, but they could vary if scaling were different.
+  // size and print them to screen.
   template <int dim>
   void EulerProblem<dim>::run()
   {
@@ -2210,7 +3044,7 @@ namespace Euler_DG
     rk_register_1.reinit(solution);
     rk_register_2.reinit(solution);
 
-    euler_operator.project(ExactSolution<dim>(time), solution);
+    euler_operator.project(ExactSolution<dim>(0), solution);
 
     double min_vertex_distance = std::numeric_limits<double>::max();
     for (const auto &cell : triangulation.active_cell_iterators())
@@ -2222,11 +3056,11 @@ namespace Euler_DG
 
     time_step = courant_number * integrator.n_stages() /
                 euler_operator.compute_cell_transport_speed(solution);
+    Assert (numbers::is_finite(time_step), ExcMessage ("time_step is infinite!"));
     pcout << "Time step size: " << time_step
           << ", minimal h: " << min_vertex_distance
           << ", initial transport scaling: "
           << 1. / euler_operator.compute_cell_transport_speed(solution)
-          << std::endl
           << std::endl;
 
     output_results(0);
@@ -2248,6 +3082,12 @@ namespace Euler_DG
     // mostly done by the TimerOutput::print_wall_time_statistics() function.
     unsigned int timestep_number = 0;
 
+    // Initialize distributed average and nieghbors
+    if (use_limiter == 1){
+      slope_limiter.initialize_cell_vectors(triangulation,dof_handler,MPI_COMM_WORLD);
+      slope_limiter.configure_neighbor_cells(euler_operator);
+    }
+
     while (time < final_time - 1e-12)
       {
         ++timestep_number;
@@ -2259,12 +3099,43 @@ namespace Euler_DG
 
         {
           TimerOutput::Scope t(timer, "rk time stepping total");
-          integrator.perform_time_step(euler_operator,
-                                       time,
-                                       time_step,
-                                       solution,
-                                       rk_register_1,
-                                       rk_register_2);
+
+          // start perform_time_step
+          // get rk scheme coefficients
+          std::vector<double> ai = integrator.get_coeff(std::string("ai"));
+          std::vector<double> bi = integrator.get_coeff(std::string("bi"));
+          std::vector<double> ci = integrator.get_coeff(std::string("ci"));
+
+          AssertDimension(ai.size() + 1, bi.size());
+          euler_operator.perform_stage(time,
+                                     bi[0] * time_step,
+                                     ai[0] * time_step,
+                                     solution,
+                                     rk_register_1,
+                                     solution,
+                                     rk_register_1);
+
+          for (unsigned int stage = 1; stage < bi.size(); ++stage)
+          {
+            
+            if (use_limiter == 1){
+              // compute average and apply limiter
+              slope_limiter.compute_cell_average(euler_operator,solution);
+              slope_limiter.distribute_cell_average();
+              slope_limiter.apply(euler_operator,fe,mapping,solution);
+            }
+
+            const double c_i = ci[stage];
+            euler_operator.perform_stage(time + c_i * time_step,
+                                      bi[stage] * time_step,
+                                      (stage == bi.size() - 1 ?
+                                          0 :
+                                          ai[stage] * time_step),
+                                      rk_register_1,
+                                      rk_register_2,
+                                      solution,
+                                      rk_register_1);
+          }
         }
 
         time += time_step;
@@ -2284,8 +3155,8 @@ namespace Euler_DG
 
 
 
-// The main() function is not surprising and follows what was done in all
-// previous MPI programs: As we run an MPI program, we need to call `MPI_Init()`
+// The main() function is not surprising and follows what was done in
+// MPI programs: As we run an MPI program, we need to call `MPI_Init()`
 // and `MPI_Finalize()`, which we do through the
 // Utilities::MPI::MPI_InitFinalize data structure. Note that we run the program
 // only with MPI, and set the thread count to 1.
@@ -2302,6 +3173,7 @@ int main(int argc, char **argv)
 
       EulerProblem<dimension> euler_problem;
       euler_problem.run();
+
     }
   catch (std::exception &exc)
     {
